@@ -15,8 +15,8 @@ public final class RecorderMain {
 
     // You can configure these directly or override with command-line options.
     private static final String DEFAULT_URL = "http://localhost:4200/";
-    private static final String DEFAULT_PROJECT = "sample-ui";
-    private static final String DEFAULT_RUN_ID = "RUN001";
+    private static final String DEFAULT_PROJECT = "sample";
+    private static final String DEFAULT_RUN_ID = "";
 
     public static void main(String[] args) throws Exception {
         Config config = Config.from(args);

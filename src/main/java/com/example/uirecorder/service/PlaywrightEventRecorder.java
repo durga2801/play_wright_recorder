@@ -42,8 +42,15 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
                 try {
                     JsonNode node = mapper.readTree(text.substring(CONSOLE_PREFIX.length()));
                     captured.add(node);
-                    System.out.println("[RECORDED] " + node.path("action").asText() + " -> "
-                            + node.path("label").asText(node.path("text").asText("")));
+                    String semantic = firstNonBlank(
+                            node.path("label").asText(""),
+                            node.path("ariaLabel").asText(""),
+                            node.path("name").asText(""),
+                            node.path("id").asText(""),
+                            node.path("text").asText(""),
+                            node.path("placeholder").asText("")
+                    );
+                    System.out.println("[RECORDED] " + node.path("action").asText() + " -> " + semantic);
                 } catch (Exception e) {
                     System.err.println("Unable to parse recorder event: " + e.getMessage());
                 }
@@ -82,12 +89,11 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
                     text(n, "placeholder"), text(n, "selector")
             );
             String action = text(n, "action");
-            String inputName = "INPUT".equals(action) || "CHANGE".equals(action) || "SELECT".equals(action)
-                    ? NameUtil.inputName(element) : null;
+            String elementName = NameUtil.elementName(element);
             Boolean checked = n.has("checked") && !n.get("checked").isNull() ? n.get("checked").asBoolean() : null;
             events.add(new RecordedEvent(
-                    sequence++, n.path("timestamp").asLong(), action, text(n, "url"), element,
-                    inputName, textOrNull(n, "value"), checked, textOrNull(n, "key")
+                    sequence++, n.path("timestamp").asLong(), action, text(n, "url"),
+                    elementName, element, textOrNull(n, "value"), checked, textOrNull(n, "key")
             ));
         }
         return events;
@@ -126,6 +132,13 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
         return value.isBlank() ? null : value;
     }
 
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) return value;
+        }
+        return "unnamed_element";
+    }
+
     @Override
     public void close() {
         browser.close();
@@ -138,91 +151,138 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
           window.__uiRecorderInstalled = true;
           window.__uiRecorderEvents = [];
 
-          const clean = v => (v || '').replace(/\\s+/g, ' ').trim();
+          const clean = v => (v || '').replace(/\s+/g, ' ').trim();
+          const shortText = v => {
+            const t = clean(v);
+            return t.length > 160 ? t.substring(0, 160) : t;
+          };
 
           function associatedLabel(el) {
             try {
+              if (!el) return '';
               if (el.labels && el.labels.length) {
-                const t = Array.from(el.labels).map(x => clean(x.innerText || x.textContent)).filter(Boolean).join(' ');
+                const t = Array.from(el.labels)
+                  .map(x => clean(x.innerText || x.textContent))
+                  .filter(Boolean).join(' ');
                 if (t) return t;
               }
               if (el.id) {
                 const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
                 if (l) return clean(l.innerText || l.textContent);
               }
-              const parent = el.closest && el.closest('label');
-              if (parent) return clean(parent.innerText || parent.textContent);
+              const parentLabel = el.closest && el.closest('label');
+              if (parentLabel) return clean(parentLabel.innerText || parentLabel.textContent);
+
               const labelledBy = el.getAttribute && el.getAttribute('aria-labelledby');
               if (labelledBy) {
-                const t = labelledBy.split(/\\s+/).map(id => document.getElementById(id)).filter(Boolean)
+                const t = labelledBy.split(/\s+/)
+                  .map(id => document.getElementById(id)).filter(Boolean)
                   .map(x => clean(x.innerText || x.textContent)).filter(Boolean).join(' ');
                 if (t) return t;
+              }
+
+              // Common form wrappers when markup does not use label[for].
+              const wrapper = el.closest && el.closest(
+                '.form-group,.form-field,.field,.input-group,.mat-mdc-form-field,.mat-form-field'
+              );
+              if (wrapper) {
+                const l = wrapper.querySelector('label,.mat-mdc-form-field-label,.mat-form-field-label');
+                if (l) return clean(l.innerText || l.textContent);
               }
             } catch (_) {}
             return '';
           }
 
-          function cssSelector(el) {
+          // Deliberately avoid long DOM paths. This is only a last-resort stable hint.
+          function stableSelector(el) {
             if (!el || el.nodeType !== 1) return '';
+            if (el.getAttribute('data-testid')) return '[data-testid="' + CSS.escape(el.getAttribute('data-testid')) + '"]';
+            if (el.getAttribute('data-test')) return '[data-test="' + CSS.escape(el.getAttribute('data-test')) + '"]';
             if (el.id) return '#' + CSS.escape(el.id);
-            const parts = [];
-            let node = el;
-            for (let depth = 0; node && node.nodeType === 1 && depth < 5; depth++, node = node.parentElement) {
-              let part = node.tagName.toLowerCase();
-              if (node.getAttribute('name')) part += '[name="' + CSS.escape(node.getAttribute('name')) + '"]';
-              else if (node.classList && node.classList.length) part += '.' + Array.from(node.classList).slice(0,2).map(CSS.escape).join('.');
-              parts.unshift(part);
+            if (el.getAttribute('name')) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.getAttribute('name')) + '"]';
+            return '';
+          }
+
+          function semanticText(el) {
+            const tag = (el.tagName || '').toLowerCase();
+            const role = clean(el.getAttribute && el.getAttribute('role'));
+            if (['button','a','option'].includes(tag) ||
+                ['button','link','tab','option','menuitem'].includes(role)) {
+              return shortText(el.innerText || el.textContent);
             }
-            return parts.join(' > ');
+            return '';
           }
 
           function base(el) {
-            const inputType = el.tagName && el.tagName.toLowerCase() === 'input' ? String(el.type || '') : '';
+            const tag = (el.tagName || '').toLowerCase();
+            const inputType = tag === 'input' ? String(el.type || '') : '';
             return {
               timestamp: Date.now(),
               url: location.href,
-              tag: (el.tagName || '').toLowerCase(),
+              tag,
               inputType,
               label: associatedLabel(el),
               ariaLabel: clean(el.getAttribute && el.getAttribute('aria-label')),
               role: clean(el.getAttribute && el.getAttribute('role')) || inputType,
-              text: clean(el.innerText || el.textContent),
+              text: semanticText(el),
               id: clean(el.id),
               name: clean(el.getAttribute && el.getAttribute('name')),
               placeholder: clean(el.getAttribute && el.getAttribute('placeholder')),
-              selector: cssSelector(el)
+              selector: stableSelector(el)
             };
+          }
+
+          function semanticName(el) {
+            const b = base(el);
+            return b.label || b.ariaLabel || b.name || b.id || b.text || b.placeholder || 'unnamed_element';
           }
 
           function push(action, el, extra = {}) {
             if (!el || el.nodeType !== 1) return;
             const event = Object.assign(base(el), {action}, extra);
             window.__uiRecorderEvents.push(event);
-            // console.log is intentionally used instead of console.debug because it is
-            // consistently surfaced by Playwright/IDEs.
             console.log('__UI_RECORDER_EVENT__' + JSON.stringify(event));
           }
 
-          function meaningfulClickTarget(target) {
+          function meaningfulTarget(target) {
             if (!target) return null;
             if (target.nodeType !== 1) target = target.parentElement;
             if (!target) return null;
-            return target.closest && target.closest(
-              'button,a,input,textarea,select,label,[role=button],[role=link],[role=tab],'+
+
+            let el = target.closest && target.closest(
+              'button,a,input,textarea,select,[role=button],[role=link],[role=tab],'+
               '[role=checkbox],[role=radio],[role=option],[role=menuitem],[role=combobox],'+
-              '[onclick],[tabindex]'
-            ) || target;
+              '[contenteditable=true],[onclick]'
+            );
+
+            // If a label was clicked, use its associated control instead of recording the label HTML/text.
+            if (!el) {
+              const label = target.closest && target.closest('label');
+              if (label && label.control) el = label.control;
+            }
+            return el || null;
           }
 
           document.addEventListener('click', e => {
-            const el = meaningfulClickTarget(e.target);
-            if (!el) return;
+            const el = meaningfulTarget(e.target);
+            if (!el) return; // Do not capture arbitrary div/span HTML structure.
+
+            const tag = (el.tagName || '').toLowerCase();
             const type = String(el.type || '').toLowerCase();
+
             if (type === 'checkbox' || type === 'radio') {
-              push(type === 'radio' ? 'RADIO' : 'CHECK', el, {checked: !!el.checked, value: el.value || null});
-            } else {
-              push('CLICK', el);
+              push(type === 'radio' ? 'RADIO' : 'CHECK', el,
+                   {checked: !!el.checked, value: el.value || null});
+              return;
             }
+
+            // A click used only to focus a text/select field is noise. INPUT/SELECT captures it semantically.
+            if (tag === 'textarea' || tag === 'select' ||
+                (tag === 'input' && !['button','submit','reset'].includes(type))) {
+              return;
+            }
+
+            push('CLICK', el);
           }, true);
 
           document.addEventListener('input', e => {
@@ -230,7 +290,7 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
             if (!el || el.nodeType !== 1) return;
             const tag = (el.tagName || '').toLowerCase();
             const type = String(el.type || '').toLowerCase();
-            if (tag === 'select' || type === 'checkbox' || type === 'radio' || type === 'file') return;
+            if (tag === 'select' || ['checkbox','radio','file','button','submit','reset'].includes(type)) return;
             push('INPUT', el, {value: el.value ?? ''});
           }, true);
 
@@ -239,13 +299,21 @@ public final class PlaywrightEventRecorder implements AutoCloseable {
             if (!el || el.nodeType !== 1) return;
             const tag = (el.tagName || '').toLowerCase();
             const type = String(el.type || '').toLowerCase();
-            if (tag === 'select') push('SELECT', el, {value: el.value ?? ''});
-            else if (type === 'checkbox' || type === 'radio') push(type === 'radio' ? 'RADIO' : 'CHECK', el, {checked: !!el.checked, value: el.value || null});
-            else push('CHANGE', el, {value: el.value ?? ''});
+            if (tag === 'select') {
+              const option = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+              push('SELECT', el, {value: el.value ?? '', selectedText: option ? clean(option.text) : ''});
+            } else if (type === 'checkbox' || type === 'radio') {
+              push(type === 'radio' ? 'RADIO' : 'CHECK', el,
+                   {checked: !!el.checked, value: el.value || null});
+            } else {
+              push('CHANGE', el, {value: el.value ?? ''});
+            }
           }, true);
 
           document.addEventListener('keydown', e => {
-            if (['Enter', 'Tab', 'Escape'].includes(e.key)) push('KEY', e.target, {key: e.key});
+            if (!['Enter', 'Tab', 'Escape'].includes(e.key)) return;
+            const el = meaningfulTarget(e.target) || e.target;
+            if (el && el.nodeType === 1) push('KEY', el, {key: e.key});
           }, true);
 
           console.log('__UI_RECORDER_READY__');
